@@ -4,8 +4,9 @@ import numpy as np
 import copy
 from highway_env import utils
 from highway_env.road.road import Road, LaneIndex, Route
-from highway_env.types import Vector
+from highway_env.typesb import Vector
 from highway_env.vehicle.kinematics import Vehicle
+from highway_env.road.objects import RoadObject
 
 
 class ControlledVehicle(Vehicle):
@@ -27,6 +28,20 @@ class ControlledVehicle(Vehicle):
     KP_LATERAL = 1/3 * KP_HEADING  # [1/s]
     MAX_STEERING_ANGLE = np.pi / 3  # [rad]
     DELTA_SPEED = 5  # [m/s]
+    
+    """ Parameter for longitudinal IDM-behavior """
+    
+    ACC_MAX = 9.0  # [m/s2]
+#    ACC_MAX = 6.0  # [m/s2]
+    COMFORT_ACC_MAX = 5.0  # [m/s2]
+#    COMFORT_ACC_MAX = 3.0  # [m/s2]
+    COMFORT_ACC_MIN = -8.5  # [m/s2]
+#    COMFORT_ACC_MIN = -5.0  # [m/s2]
+    DISTANCE_WANTED = 4 + Vehicle.LENGTH  # [m]
+#    DISTANCE_WANTED = 5 + Vehicle.LENGTH  # [m]
+    TIME_WANTED = 0.5 # [s]
+#    TIME_WANTED = 1.5 # [s]
+    DELTA = 4.0  # []
 
     def __init__(self,
                  road: Road,
@@ -81,6 +96,7 @@ class ControlledVehicle(Vehicle):
 
         :param action: a high-level action
         """
+        front_vehicle, rear_vehicle = self.road.neighbour_vehicles(self)
         self.follow_road()
         if action == "FASTER":
             self.target_speed += self.DELTA_SPEED
@@ -97,8 +113,14 @@ class ControlledVehicle(Vehicle):
             if self.road.network.get_lane(target_lane_index).is_reachable_from(self.position):
                 self.target_lane_index = target_lane_index
 
+#        action = {"steering": self.steering_control(self.target_lane_index),
+#                  "acceleration": self.speed_control(self.target_speed)}
+  
         action = {"steering": self.steering_control(self.target_lane_index),
-                  "acceleration": self.speed_control(self.target_speed)}
+                  "acceleration": self.acceleration_ego(ego_vehicle=self,
+                                                   front_vehicle=front_vehicle,
+                                                   rear_vehicle=rear_vehicle)}
+                  
         action['steering'] = np.clip(action['steering'], -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE)
         super().act(action)
 
@@ -110,6 +132,62 @@ class ControlledVehicle(Vehicle):
                                                                  position=self.position,
                                                                  np_random=self.road.np_random)
 
+    def acceleration_ego(self,
+                     ego_vehicle: Vehicle,
+                     front_vehicle: Vehicle = None,
+                     rear_vehicle: Vehicle = None) -> float:
+
+        if not ego_vehicle or isinstance(ego_vehicle, RoadObject):
+            return 0
+
+        target_lane = self.road.network.get_lane(self.target_lane_index)
+        lane_coords = target_lane.local_coordinates(self.position)
+                
+#        if ego_vehicle.lane_index != self.target_lane_index and abs(ego_vehicle.heading) > abs(target_lane.heading_at(lane_coords[0])) + 0.05:
+        while abs(ego_vehicle.heading) > abs(target_lane.heading_at(lane_coords[0])) + 0.05:
+            acceleration = 0
+            break
+        else:        
+            ego_target_speed = utils.not_zero(getattr(ego_vehicle, "target_speed", 0))
+#           ego_target_speed = self.target_speed    
+            acceleration = self.COMFORT_ACC_MAX * (
+                    1 - np.power(max(ego_vehicle.speed, 0) / ego_target_speed, self.DELTA))
+
+            if front_vehicle:
+                d = ego_vehicle.lane_distance_to(front_vehicle, self.lane)
+                acceleration -= self.COMFORT_ACC_MAX * \
+                    np.power(self.desired_gap(ego_vehicle, front_vehicle) / utils.not_zero(d), 2)
+        return acceleration
+            
+    def desired_gap(self, ego_vehicle: Vehicle, front_vehicle: Vehicle = None, projected: bool = True) -> float:
+ 
+        d0 = self.DISTANCE_WANTED
+        tau = self.TIME_WANTED
+        ab = -self.COMFORT_ACC_MAX * self.COMFORT_ACC_MIN
+        dv = np.dot(ego_vehicle.velocity - front_vehicle.velocity, ego_vehicle.direction) if projected \
+            else ego_vehicle.speed - front_vehicle.speed
+        d_star = d0 + ego_vehicle.speed * tau + ego_vehicle.speed * dv / (2 * np.sqrt(ab))
+        return d_star
+
+#    def maximum_speed(self, front_vehicle: Vehicle = None) -> Tuple[float, float]:
+#
+#        if not front_vehicle:
+#            return self.target_speed
+#        d0 = self.DISTANCE_WANTED
+#        a0 = self.COMFORT_ACC_MIN
+#        a1 = self.COMFORT_ACC_MIN
+#        tau = self.TIME_WANTED
+#        d = max(self.lane_distance_to(front_vehicle) - self.LENGTH / 2 - front_vehicle.LENGTH / 2 - d0, 0)
+#        v1_0 = front_vehicle.speed
+#        delta = 4 * (a0 * a1 * tau) ** 2 + 8 * a0 * (a1 ** 2) * d + 4 * a0 * a1 * v1_0 ** 2
+#        v_max = -a0 * tau + np.sqrt(delta) / (2 * a1)
+
+#        # Speed control
+#        self.target_speed = min(self.maximum_speed(front_vehicle), self.target_speed)
+#        acceleration = self.speed_control(self.target_speed)
+#
+#        return v_max, acceleration
+        
     def steering_control(self, target_lane_index: LaneIndex) -> float:
         """
         Steer the vehicle to follow the center of an given lane.
@@ -137,8 +215,10 @@ class ControlledVehicle(Vehicle):
         # Heading rate to steering angle
         steering_angle = np.arcsin(np.clip(self.LENGTH / 2 / utils.not_zero(self.speed) * heading_rate_command,
                                            -1, 1))
+#        steering_angle = 0
         steering_angle = np.clip(steering_angle, -self.MAX_STEERING_ANGLE, self.MAX_STEERING_ANGLE)
         return float(steering_angle)
+
 
     def speed_control(self, target_speed: float) -> float:
         """
@@ -150,6 +230,7 @@ class ControlledVehicle(Vehicle):
         :return: an acceleration command [m/s2]
         """
         return self.KP_A * (target_speed - self.speed)
+
 
     def get_routes_at_intersection(self) -> List[Route]:
         """Get the list of routes that can be followed at the next intersection."""
